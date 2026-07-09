@@ -69,6 +69,11 @@ class EuromPacWifi : Driver
   var current_humidity
   var target_humidity
   var timer_hours
+  # cached lookup tables (built once to avoid per-frame/per-command allocations)
+  var _mode_decode
+  var _speed_decode
+  var _mode_encode
+  var _speed_encode
 
   # intialize the serial port, TX and RX defined in the template as SerTX and SerRX
   def init(tx, rx)
@@ -88,6 +93,11 @@ class EuromPacWifi : Driver
     self.power = false
     self.swing = false
     self.timer_hours = 0
+    # build lookup tables once (avoid re-allocating them on every frame/command)
+    self._mode_decode  = {0x01: self.MODE_COOL, 0x03: self.MODE_DRY, 0x06: self.MODE_FAN}
+    self._speed_decode = {0x10: self.FAN_HIGH, 0x20: self.FAN_MEDIUM, 0x30: self.FAN_LOW}
+    self._mode_encode  = {self.MODE_COOL: 0x01, self.MODE_DRY: 0x03, self.MODE_FAN: 0x06}
+    self._speed_encode = {self.FAN_HIGH: 0x01, self.FAN_MEDIUM: 0x02, self.FAN_LOW: 0x03}
     tasmota.add_driver(self)
   end
 
@@ -110,6 +120,10 @@ class EuromPacWifi : Driver
     else
         self._heartbeat_publish_timer -= 1
     end
+    # force periodic garbage collection to keep heap fragmentation in check
+    if self._heartbeat_timer % 30 == 0
+        tasmota.gc()
+    end
   end
 
   # read serial port
@@ -126,49 +140,38 @@ class EuromPacWifi : Driver
     var data = datagram[0..9]
     var current_chks = datagram[10..11]
     var expected_chks = self.checksum(data)
-    var mode_codes = {
-        0x01 : self.MODE_COOL,
-        0x03 : self.MODE_DRY,
-        0x06 : self.MODE_FAN
-    }
-    var speed_codes = {
-        0x10 : self.FAN_HIGH,
-        0x20 : self.FAN_MEDIUM,
-        0x30 : self.FAN_LOW
-    }
     var changes = []
-    if data[0] == self.HEADER[0]
-      if current_chks == expected_chks
-        var power = bool(data[1] & (1 << 0))
-        changes += (self.power != power) ? ["power"] : []
-        self.power = power
-        var swing = bool(data[1] & (1 << 2))
-        changes += (self.swing != swing) ? ["swing"] : []
-        self.swing = swing
-        var speed = speed_codes.find(data[3] & 0xF0, self.UNDEFINED)
-        changes += (self.speed != speed) ? ["fan"] : []
-        self.speed = speed
-        var mode = mode_codes.find(data[3] & 0x0F, self.UNDEFINED)
-        changes += (self.mode != mode) ? ["mode"] : []
-        self.mode = mode
-        changes += (self.current_temperature != data[4]) ? ["current_temperature"] : []
-        self.current_temperature = data[4]
-        changes += (self.target_temperature != data[5]) ? ["target_temperature"] : []
-        self.target_temperature = data[5]
-        changes += (self.current_humidity != data[6]) ? ["current_humidity"] : []
-        self.current_humidity = data[6]
-        changes += (self.target_humidity != data[7]) ? ["target_humidity"] : []
-        self.target_humidity = data[7]
-        changes += (self.timer_hours != data[8]) ? ["timer"] : []
-        self.timer_hours = data[8]
-        self._previous_checksum = current_chks
-        return changes
-      else
-        self._log.Error(f"Data CheckSum8 XOR Error: {current_chks} != checksum({data}) == {expected_chks}")
-      end
-    else
+    if data[0] != self.HEADER[0]
       self._log.Error(f"Data Header Error: {data[0]} != {self.HEADER}")
+      return changes
     end
+    if current_chks != expected_chks
+      self._log.Error(f"Data CheckSum8 XOR Error: {current_chks} != {expected_chks}")
+      return changes
+    end
+    var power = bool(data[1] & (1 << 0))
+    if self.power != power changes.push("power") end
+    self.power = power
+    var swing = bool(data[1] & (1 << 2))
+    if self.swing != swing changes.push("swing") end
+    self.swing = swing
+    var speed = self._speed_decode.find(data[3] & 0xF0, self.UNDEFINED)
+    if self.speed != speed changes.push("fan") end
+    self.speed = speed
+    var mode = self._mode_decode.find(data[3] & 0x0F, self.UNDEFINED)
+    if self.mode != mode changes.push("mode") end
+    self.mode = mode
+    if self.current_temperature != data[4] changes.push("current_temperature") end
+    self.current_temperature = data[4]
+    if self.target_temperature != data[5] changes.push("target_temperature") end
+    self.target_temperature = data[5]
+    if self.current_humidity != data[6] changes.push("current_humidity") end
+    self.current_humidity = data[6]
+    if self.target_humidity != data[7] changes.push("target_humidity") end
+    self.target_humidity = data[7]
+    if self.timer_hours != data[8] changes.push("timer") end
+    self.timer_hours = data[8]
+    self._previous_checksum = current_chks
     return changes
   end
 
@@ -182,17 +185,17 @@ class EuromPacWifi : Driver
         var datagram = msg[(self._prefix_len)..(self.MSG_LEN-self._msg_suffix_len-1)]
         var ketiag = msg[(self.MSG_LEN-self._msg_suffix_len)..(self.MSG_LEN-1)]
         if gaitek == self.PREFIX && ketiag == self.MSG_SUFFIX
-          self._log.Debug(f"UART RX={str(msg)}")
+          # avoid str(msg) allocation on every frame; re-enable only when debugging
           return self.decode_msg(datagram)
         end
       end
-      self._log.Error(f"UART error decoding frame RX={str(msg)} size={size(msg)}")
-    elif s > 24
-      var msg = self._uart.read()
-      self._log.Error(f"UART error: frame RX={str(msg)} size={size(msg)} too big")
+      self._log.Error(f"UART error decoding frame size={size(msg)}")
+    elif s > self.MSG_LEN
+      self._uart.read()
       self._uart.flush()
+      self._log.Error(f"UART overflow, flushing {s} bytes")
     end
-    return []
+    return nil
   end
 
   def send(data)
@@ -243,45 +246,35 @@ class EuromPacWifi : Driver
   end
 
   def set_speed(value)
-    var cmd = bytes("0700000000") 
-    var speed_codes = {
-        self.FAN_HIGH: 0x01,
-        self.FAN_MEDIUM: 0x02,
-        self.FAN_LOW: 0x03
-    }
     if self.speed == value
       self._log.Debug(f"Fan speed is already set to {value}")
       return 0
     end
-    try
-      cmd.set(1, speed_codes[value])
-      self._log.Debug(f"Set fan speed to {value}")
-      return self.send(cmd)
-    except .. as e,m
-      self._log.Error(f"Error: fan speed not set, {str(e)}: {m}")
+    var code = self._speed_encode.find(value)
+    if code == nil
+      self._log.Error(f"Error: fan speed not set, invalid value {value}")
+      return -1
     end
-    return -1
+    var cmd = bytes("0700000000")
+    cmd.set(1, code)
+    self._log.Debug(f"Set fan speed to {value}")
+    return self.send(cmd)
   end
 
   def set_mode(value)
-    var cmd = bytes("0600000000") 
-    var mode_codes = {
-        self.MODE_COOL: 0x01,
-        self.MODE_DRY: 0x03,
-        self.MODE_FAN: 0x06
-    }
     if self.mode == value
       self._log.Debug(f"Mode is already set to {value}")
       return 0
     end
-    try
-      cmd.set(1, mode_codes[value])
-      self._log.Debug(f"Set mode to {value}")
-      return self.send(cmd)
-    except .. as e,m
-      self._log.Error(f"Error: mode not set, {str(e)}: {m}")
+    var code = self._mode_encode.find(value)
+    if code == nil
+      self._log.Error(f"Error: mode not set, invalid value {value}")
+      return -1
     end
-    return -1
+    var cmd = bytes("0600000000")
+    cmd.set(1, code)
+    self._log.Debug(f"Set mode to {value}")
+    return self.send(cmd)
   end
 
   def set_temperature(value)
