@@ -57,6 +57,7 @@ Automatically the Tasmota web will become:
 
 ![ESP32s2 FS](esp32s2_driver.png "ESP32s2 FS")
 
+Memory fragmentation: watch the heap with `Status 4` on the Tasmota console over a day or two — `MinFreeHeap` should remain stable.
 
 ### 4. Home Assistant
 
