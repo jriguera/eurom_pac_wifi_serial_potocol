@@ -59,6 +59,77 @@ Automatically the Tasmota web will become:
 
 Memory fragmentation: watch the heap with `Status 4` on the Tasmota console over a day or two — `MinFreeHeap` should remain stable.
 
+#### Preventing an unresponsive controller (auto-reboot safety nets)
+
+On some setups the ESP may still become unresponsive after several days of continuous operation (typically due to heap fragmentation), requiring a manual power-cycle. Until the root cause is fully eliminated, the following Tasmota rules keep the device alive by rebooting it automatically. Enter them once on the Tasmota **Console** — rules are persisted and survive reboots. NTP time must be set for the scheduled reboot (check with `Status 7`).
+
+**Option 1 — Scheduled daily reboot (recommended)**
+
+Reboots every day at 04:00, long before fragmentation builds up:
+```
+Rule1 ON Time#Minute=240 DO Restart 1 ENDON
+Rule1 1
+```
+`Time#Minute` counts minutes since midnight (`240` = 04:00). To reboot every 12 hours instead, use two triggers:
+```
+Rule1 ON Time#Minute=240 DO Restart 1 ENDON ON Time#Minute=960 DO Restart 1 ENDON
+Rule1 1
+```
+
+**Option 2 — Low-heap safety net**
+
+Reboots *before* the device hangs, by restarting whenever the reported free heap drops below ~10 KB:
+```
+Rule2 ON Tele-Heap<10 DO Restart 1 ENDON
+Rule2 1
+```
+`Tele-Heap` is reported every `TelePeriod` seconds (default `300`). For a faster reaction, lower the telemetry period, e.g. `TelePeriod 60`.
+
+Both options can be enabled at the same time (`Rule1` for the scheduled reboot and `Rule2` as a backstop).
+
+#### Monitoring the heap in Home Assistant
+
+To see whether the free heap is trending down over time, expose it as an MQTT sensor in Home Assistant and graph it. No changes on the ESP are needed — Tasmota already publishes the free heap (in KB) as `Heap` in its telemetry.
+
+**1. Make sure Tasmota emits telemetry regularly**
+
+On the Tasmota **Console**, set the telemetry period (e.g. 5 minutes):
+```
+TelePeriod 300
+```
+Every `TelePeriod` seconds Tasmota publishes a JSON to `tele/MobileAirco/STATE` that includes `"Heap":NN`.
+
+**2. Add an MQTT sensor in Home Assistant**
+
+Add this to your HA `configuration.yaml`. If you already have a top-level `mqtt:` key with `- climate:`, add `- sensor:` as another list item under it rather than creating a second `mqtt:` block:
+```yaml
+mqtt:
+  - sensor:
+      name: "EuromAirco Heap"
+      unique_id: tasmota_eurom_pac_wifi_heap
+      state_topic: "tele/MobileAirco/STATE"
+      value_template: "{{ value_json.Heap }}"
+      unit_of_measurement: "kB"
+      state_class: measurement
+      icon: mdi:memory
+      availability_topic: "tele/MobileAirco/LWT"
+      payload_available: Online
+      payload_not_available: Offline
+```
+Because `state_class: measurement` is set, HA records long-term statistics automatically. Graph `sensor.euromairco_heap` with a built-in **History** / **Statistics graph** card, or with the ApexCharts custom card:
+```yaml
+type: custom:apexcharts-card
+header:
+  title: EuromAirco Free Heap
+  show: true
+graph_span: 7d
+series:
+  - entity: sensor.euromairco_heap
+    name: Free Heap
+    unit: kB
+```
+A steadily declining trend over days indicates fragmentation; a sawtooth that recovers after each scheduled reboot confirms the auto-reboot workaround is working.
+
 ### 4. Home Assistant
 
 Setup the MQTT settings in Tasmota and put this in the HA configuration file:
