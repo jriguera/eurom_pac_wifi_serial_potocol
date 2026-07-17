@@ -49,11 +49,14 @@ class EuromPacWifi : Driver
   static TARGET_RANGE_TEMP = [16, 31]
   static TARGET_RANGE_HUM = [30, 90]
   static HEARTBEAT_PUBLISH_SEC = 300
+  # minimum absolute change (in %) of current_humidity needed to trigger a report
+  static HUMIDITY_REPORT_DELTA = 2
 
   # create serial port object
   var _uart
   var _heartbeat_timer
   var _heartbeat_publish_timer
+  var _reported_humidity
   var _previous_checksum
   var _log
   var _prefix_len
@@ -93,6 +96,14 @@ class EuromPacWifi : Driver
     self.power = false
     self.swing = false
     self.timer_hours = 0
+    # initialize numeric state so state_report()/web_sensor() never operate on nil
+    # before the first valid serial frame is received
+    self.current_temperature = 0
+    self.target_temperature = 0
+    self.current_humidity = 0
+    self.target_humidity = 0
+    # last current_humidity value that was actually reported (deadband reference)
+    self._reported_humidity = 0
     # build lookup tables once (avoid re-allocating them on every frame/command)
     self._mode_decode  = {0x01: self.MODE_COOL, 0x03: self.MODE_DRY, 0x06: self.MODE_FAN}
     self._speed_decode = {0x10: self.FAN_HIGH, 0x20: self.FAN_MEDIUM, 0x30: self.FAN_LOW}
@@ -165,8 +176,15 @@ class EuromPacWifi : Driver
     self.current_temperature = data[4]
     if self.target_temperature != data[5] changes.push("target_temperature") end
     self.target_temperature = data[5]
-    if self.current_humidity != data[6] changes.push("current_humidity") end
+    # only report current_humidity when it changed at least HUMIDITY_REPORT_DELTA %
+    # since the last reported value (avoids frequent small fluctuations)
     self.current_humidity = data[6]
+    var hum_delta = self.current_humidity - self._reported_humidity
+    if hum_delta < 0 hum_delta = -hum_delta end
+    if hum_delta >= self.HUMIDITY_REPORT_DELTA
+      self._reported_humidity = self.current_humidity
+      changes.push("current_humidity")
+    end
     if self.target_humidity != data[7] changes.push("target_humidity") end
     self.target_humidity = data[7]
     if self.timer_hours != data[8] changes.push("timer") end
@@ -545,7 +563,7 @@ end
   def tasmota_sethum_cmd_handler(cmd, idx, payload, payload_json)
     var js = isinstance(payload_json, map)
     var action = (!js) ? payload : payload_json.find(cmd) != nil ? payload_json.find(cmd) : ""
-    var ret = (action != "") ? self.set_humidity(int(action)) : 0
+    var ret = (action != "") ? self.set_humidity(int(real(action))) : 0
     if ret < 0
         tasmota.resp_cmnd_failed()
     else
@@ -560,7 +578,7 @@ end
   def tasmota_settemp_cmd_handler(cmd, idx, payload, payload_json)
     var js = isinstance(payload_json, map)
     var action = (!js) ? payload : payload_json.find(cmd) != nil ? payload_json.find(cmd) : ""
-    var ret = (action != "") ? self.set_temperature(int(action)) : 0
+    var ret = (action != "") ? self.set_temperature(int(real(action))) : 0
     if ret < 0
         tasmota.resp_cmnd_failed()
     else
